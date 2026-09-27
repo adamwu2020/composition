@@ -586,6 +586,10 @@
                     errorDiv.style.display = 'none';
                 } else {
                     errorDiv.textContent = data.error || 'Failed to generate article';
+                    // Admins also get the raw upstream provider error for diagnosis.
+                    if (data.upstream_error) {
+                        errorDiv.textContent += ' [upstream: ' + data.upstream_error + ']';
+                    }
                     errorDiv.style.display = 'block';
                     successDiv.style.display = 'none';
                 }

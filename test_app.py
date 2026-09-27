@@ -14,7 +14,7 @@ os.environ['OPENAI_API_KEY'] = 'sk-test-fake-key'
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app import app as flask_app
+from app import app as flask_app, is_quota_error, openai_error_fields
 from models import (db, User, Subscription, QueryLog, PLANS,
                     get_app_price, set_app_price, app_is_free)
 from werkzeug.security import generate_password_hash
@@ -542,3 +542,131 @@ class TestAdminDashboard:
         assert r.status_code == 403
         with app.app_context():
             assert get_app_price() == 4.99
+
+
+# ---------------------------------------------------------------------------
+# Upstream OpenAI error classification
+# ---------------------------------------------------------------------------
+
+def make_rate_limit_error(payload):
+    """Build a RateLimitError the way the OpenAI SDK does."""
+    import httpx
+    from openai import RateLimitError
+    req = httpx.Request('POST', 'https://api.openai.com/v1/chat/completions')
+    if payload is None:
+        resp = httpx.Response(429, request=req, text='Too Many Requests')
+    else:
+        resp = httpx.Response(429, request=req, json=payload)
+    return RateLimitError('Error code: 429', response=resp, body=payload)
+
+
+def err_body(message, err_type=None, code=None):
+    return {'error': {'message': message, 'type': err_type, 'param': None, 'code': code}}
+
+
+class TestUpstreamErrorClassification:
+    """Quota exhaustion must never be reported as generic rate limiting,
+    whichever field OpenAI happens to populate."""
+
+    @pytest.mark.parametrize('payload', [
+        err_body('You have no credits remaining.', 'insufficient_quota', 'credit_balance_exhausted'),
+        err_body('You exceeded your current quota, please check your plan and billing details.',
+                 'insufficient_quota', None),
+        err_body('You exceeded your current quota.', 'insufficient_quota', 'insufficient_quota'),
+        err_body('Billing hard limit has been reached', 'invalid_request_error',
+                 'billing_hard_limit_reached'),
+        err_body('You have no credits remaining. Add credits to continue.', None, None),
+    ])
+    def test_quota_errors_detected(self, payload):
+        assert is_quota_error(make_rate_limit_error(payload)) is True
+
+    @pytest.mark.parametrize('payload', [
+        err_body('Rate limit reached for gpt-4o-mini in org org-x', 'requests', 'rate_limit_exceeded'),
+        err_body('Too many concurrent requests', 'tokens', 'rate_limit_exceeded'),
+        None,
+    ])
+    def test_genuine_rate_limits_not_quota(self, payload):
+        assert is_quota_error(make_rate_limit_error(payload)) is False
+
+    def test_fields_extracted_from_body(self):
+        err = make_rate_limit_error(err_body('no credits', 'insufficient_quota', 'credit_balance_exhausted'))
+        code, err_type, message = openai_error_fields(err)
+        assert code == 'credit_balance_exhausted'
+        assert err_type == 'insufficient_quota'
+        assert message == 'no credits'
+
+    def test_fields_survive_missing_body(self):
+        code, err_type, message = openai_error_fields(make_rate_limit_error(None))
+        assert code == ''
+        assert err_type == ''
+        assert message  # falls back to str(exc)
+
+    @patch('app.client')
+    def test_generate_reports_credits_message_for_quota_error(self, mock_openai, client, app):
+        mock_openai.chat.completions.create.side_effect = make_rate_limit_error(
+            err_body('You exceeded your current quota, please check your plan and billing details.',
+                     'insufficient_quota', None)
+        )
+        with app.app_context():
+            make_user('q1', plan=None)
+        login(client, 'q1')
+        r = client.post('/generate', json={
+            'topic': 'cats', 'language': 'English',
+            'total_words': 100, 'grade': 1, 'language_level': 'intermediate'
+        })
+        assert r.status_code == 503
+        error = r.get_json()['error'].lower()
+        assert 'out of credits' in error
+        assert 'busy' not in error
+        # Non-admins don't see raw provider detail
+        assert 'upstream_error' not in r.get_json()
+
+    @patch('app.client')
+    def test_generate_reports_busy_for_real_rate_limit(self, mock_openai, client, app):
+        mock_openai.chat.completions.create.side_effect = make_rate_limit_error(
+            err_body('Rate limit reached for gpt-4o-mini', 'requests', 'rate_limit_exceeded')
+        )
+        with app.app_context():
+            make_user('q2', plan=None)
+        login(client, 'q2')
+        r = client.post('/generate', json={
+            'topic': 'cats', 'language': 'English',
+            'total_words': 100, 'grade': 1, 'language_level': 'intermediate'
+        })
+        assert r.status_code == 503
+        assert 'busy' in r.get_json()['error'].lower()
+
+    @patch('app.client')
+    def test_admin_sees_upstream_detail(self, mock_openai, client, app):
+        mock_openai.chat.completions.create.side_effect = make_rate_limit_error(
+            err_body('You have no credits remaining.', 'insufficient_quota', 'credit_balance_exhausted')
+        )
+        with app.app_context():
+            make_user('Eric', email='eric@test.com', plan='unlimited', plan_end_days=None)
+        login(client, 'Eric')
+        r = client.post('/generate', json={
+            'topic': 'cats', 'language': 'English',
+            'total_words': 100, 'grade': 1, 'language_level': 'intermediate'
+        })
+        assert r.status_code == 503
+        assert r.get_json()['upstream_error'] == 'You have no credits remaining.'
+
+    @patch('app.client')
+    def test_auth_error_reports_misconfiguration(self, mock_openai, client, app):
+        import httpx
+        from openai import AuthenticationError
+        req = httpx.Request('POST', 'https://api.openai.com/v1/chat/completions')
+        payload = err_body('Incorrect API key provided', 'invalid_request_error', 'invalid_api_key')
+        resp = httpx.Response(401, request=req, json=payload)
+        mock_openai.chat.completions.create.side_effect = AuthenticationError(
+            'Error code: 401', response=resp, body=payload
+        )
+        with app.app_context():
+            make_user('q3', plan=None)
+        login(client, 'q3')
+        r = client.post('/generate', json={
+            'topic': 'cats', 'language': 'English',
+            'total_words': 100, 'grade': 1, 'language_level': 'intermediate'
+        })
+        assert r.status_code == 503
+        assert 'misconfigured' in r.get_json()['error'].lower()
