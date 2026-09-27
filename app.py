@@ -50,6 +50,41 @@ app.register_blueprint(admin_bp, url_prefix='/admin')
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
+# Markers that identify an upstream billing/quota failure rather than genuine
+# rate limiting. OpenAI populates these inconsistently across error shapes
+# (sometimes `code`, sometimes only `type`, sometimes only the message), so all
+# three fields are checked.
+QUOTA_MARKERS = (
+    'insufficient_quota',
+    'credit_balance_exhausted',
+    'billing_hard_limit_reached',
+    'billing_not_active',
+    'no credits remaining',
+    'exceeded your current quota',
+    'check your plan and billing',
+)
+
+
+def openai_error_fields(exc):
+    """Pull (code, type, message) out of an OpenAI API error, whatever its shape."""
+    body = getattr(exc, 'body', None)
+    err = body.get('error') if isinstance(body, dict) else None
+    if not isinstance(err, dict):
+        err = {}
+    return (
+        str(err.get('code') or ''),
+        str(err.get('type') or ''),
+        str(err.get('message') or '') or str(exc),
+    )
+
+
+def is_quota_error(exc):
+    """True when a 429 is really 'the OpenAI account is out of credits'."""
+    code, err_type, message = openai_error_fields(exc)
+    haystack = f'{code} {err_type} {message}'.lower()
+    return any(marker in haystack for marker in QUOTA_MARKERS)
+
+
 # Register Chinese fonts for PDF generation
 def register_chinese_fonts():
     """Register Chinese fonts for ReportLab PDF generation"""
@@ -368,24 +403,38 @@ Article:"""
 
     except RateLimitError as e:
         # Upstream OpenAI account problem - NOT the user's plan or query allowance.
-        body = getattr(e, 'body', None) or {}
-        code = (body.get('error') or {}).get('code') if isinstance(body, dict) else None
-        if code in ('insufficient_quota', 'credit_balance_exhausted'):
+        code, err_type, upstream_message = openai_error_fields(e)
+        # Always log the raw upstream error; the user-facing text is deliberately vague.
+        print(f"OpenAI 429 for user {current_user.username}: "
+              f"code={code!r} type={err_type!r} message={upstream_message!r}")
+
+        if is_quota_error(e):
             message = ('The article service is temporarily unavailable: the site\'s OpenAI '
                        'API account is out of credits. This is not a limit on your account - '
                        'please contact the site administrator.')
         else:
             message = ('The article service is busy right now (rate limited upstream). '
                        'Please try again in a moment.')
-        return jsonify({'error': message, 'success': False}), 503
 
-    except AuthenticationError:
-        return jsonify({
+        payload = {'error': message, 'success': False}
+        # Admins get the raw provider detail so they can diagnose without log access.
+        if getattr(current_user, 'is_admin', False):
+            payload['upstream_error'] = upstream_message
+        return jsonify(payload), 503
+
+    except AuthenticationError as e:
+        code, err_type, upstream_message = openai_error_fields(e)
+        print(f"OpenAI auth failure for user {current_user.username}: "
+              f"code={code!r} type={err_type!r} message={upstream_message!r}")
+        payload = {
             'error': ('The article service is misconfigured: the OpenAI API key is missing or '
                       'invalid. This is not a limit on your account - please contact the site '
                       'administrator.'),
             'success': False
-        }), 503
+        }
+        if getattr(current_user, 'is_admin', False):
+            payload['upstream_error'] = upstream_message
+        return jsonify(payload), 503
 
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
