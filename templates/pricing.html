@@ -200,6 +200,12 @@
     </div>
 
     <div class="container">
+        {% if app_is_free %}
+        <div style="background: #d4edda; color: #155724; padding: 20px; border-radius: 12px; margin-bottom: 30px; text-align: center;">
+            <strong>The app is currently free for everyone.</strong>
+            <div style="margin-top: 6px;">Every account has unlimited article generation - no plan or payment needed.</div>
+        </div>
+        {% endif %}
         <div class="pricing-grid">
             {% for plan_key, plan_data in plans.items() %}
             <div class="pricing-card {% if plan_key == 'elite' %}featured{% endif %}">

@@ -1,8 +1,19 @@
+import os
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
 from datetime import datetime, timedelta
 
 db = SQLAlchemy()
+
+# Usernames allowed into the admin dashboard (comma-separated).
+ADMIN_USERNAMES = [
+    name.strip() for name in os.getenv('ADMIN_USERNAMES', 'Eric').split(',') if name.strip()
+]
+
+# App price when the admin has never set one.
+DEFAULT_APP_PRICE = float(os.getenv('DEFAULT_APP_PRICE', '0'))
+
+APP_PRICE_KEY = 'app_price'
 
 # Plan definitions
 PLANS = {
@@ -71,6 +82,11 @@ class User(UserMixin, db.Model):
     # Relationship to query logs
     query_logs = db.relationship('QueryLog', backref='user', lazy=True, cascade='all, delete-orphan')
     
+    @property
+    def is_admin(self):
+        """Admins are named in the ADMIN_USERNAMES env var (default: Eric)."""
+        return self.username in ADMIN_USERNAMES
+
     def get_active_subscription(self):
         """Get the active subscription if any"""
         # Force fresh query - expire all caches
@@ -151,6 +167,11 @@ class User(UserMixin, db.Model):
     
     def can_make_query(self):
         """Check if user can make a query based on their plan limits"""
+        # When the admin has set the app price to 0, the app is free for everyone
+        # and no plan limit applies.
+        if app_is_free():
+            return True
+
         plan_type = self.get_plan()
         plan = PLANS.get(plan_type, PLANS['free'])
         
@@ -185,7 +206,10 @@ class User(UserMixin, db.Model):
         return True
     
     def get_remaining_queries(self):
-        """Get remaining queries for current period"""
+        """Get remaining queries for current period (-1 means unlimited)"""
+        if app_is_free():
+            return -1
+
         plan_type = self.get_plan()
         plan = PLANS.get(plan_type, PLANS['free'])
         
@@ -257,3 +281,68 @@ class QueryLog(db.Model):
     language = db.Column(db.String(50), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+
+class AppSetting(db.Model):
+    """Global, admin-editable app settings stored as key/value pairs."""
+    __tablename__ = 'app_settings'
+
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    value = db.Column(db.String(255), nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+def get_setting(key, default=None):
+    """Read a setting, falling back to default if unset or the table is missing."""
+    try:
+        setting = db.session.query(AppSetting).filter_by(key=key).first()
+    except Exception:
+        # Table may not exist yet (first boot before create_all).
+        db.session.rollback()
+        return default
+    if setting is None or setting.value is None:
+        return default
+    return setting.value
+
+
+def set_setting(key, value):
+    """Write a setting, creating the row if needed."""
+    setting = db.session.query(AppSetting).filter_by(key=key).first()
+    if setting is None:
+        setting = AppSetting(key=key, value=str(value))
+        db.session.add(setting)
+    else:
+        setting.value = str(value)
+    db.session.commit()
+    return setting
+
+
+def get_app_price():
+    """Current app price in dollars. 0 means the app is free for all users."""
+    raw = get_setting(APP_PRICE_KEY)
+    if raw is None:
+        return DEFAULT_APP_PRICE
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_APP_PRICE
+
+
+def set_app_price(price):
+    """Set the app price in dollars. Raises ValueError on invalid input."""
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        raise ValueError('Price must be a number')
+    if value < 0:
+        raise ValueError('Price cannot be negative')
+    if value > 100000:
+        raise ValueError('Price is unreasonably high')
+    value = round(value, 2)
+    set_setting(APP_PRICE_KEY, f'{value:.2f}')
+    return value
+
+
+def app_is_free():
+    """True when the admin has set the app price to 0 - everyone gets unlimited use."""
+    return get_app_price() <= 0
