@@ -327,9 +327,16 @@
                 <div style="text-align: right; color: white;">
                     <p style="margin-bottom: 5px;">Welcome, <strong>{{ user.username }}</strong></p>
                     <p style="margin-bottom: 10px; font-size: 0.9em; opacity: 0.9;">
-                        Plan: {{ plan.name }} | Queries remaining: {{ remaining_queries }}
+                        {% if app_is_free %}
+                            Free for everyone &middot; unlimited articles
+                        {% else %}
+                            Plan: {{ plan.name }} | Queries remaining: {% if remaining_queries == -1 %}Unlimited{% else %}{{ remaining_queries }}{% endif %}
+                        {% endif %}
                     </p>
                     <div>
+                        {% if user.is_admin %}
+                        <a href="/admin/" style="color: white; margin-right: 15px; text-decoration: none;">Admin</a>
+                        {% endif %}
                         <a href="/payment/dashboard" style="color: white; margin-right: 15px; text-decoration: none;">Dashboard</a>
                         <a href="/auth/logout" style="color: white; text-decoration: none;">Logout</a>
                     </div>

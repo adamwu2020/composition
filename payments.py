@@ -1,6 +1,6 @@
 from flask import Blueprint, render_template, request, jsonify, redirect, url_for, flash, current_app
 from flask_login import login_required, current_user
-from models import db, User, Subscription, PLANS
+from models import db, User, Subscription, PLANS, app_is_free
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import stripe
@@ -82,12 +82,20 @@ def pricing():
     return render_template('pricing.html', 
                          stripe_publishable_key=STRIPE_PUBLISHABLE_KEY,
                          plans=PLANS,
-                         current_plan_type=current_plan_type)
+                         current_plan_type=current_plan_type,
+                         app_is_free=app_is_free())
 
 @payments_bp.route('/create-checkout-session', methods=['POST'])
 @login_required
 def create_checkout_session():
     """Create Stripe checkout session for subscription"""
+    # Don't charge anyone while the admin has the app price set to 0.
+    if app_is_free():
+        return jsonify({
+            'error': 'The app is currently free for all users - no subscription is needed.',
+            'success': False
+        }), 400
+
     try:
         # Verify Stripe API key is set
         if not stripe.api_key:
@@ -760,6 +768,13 @@ def change_plan():
     print("=" * 80)
     print("CHANGE_PLAN: Starting plan change process")
     print("=" * 80)
+
+    # Don't charge anyone while the admin has the app price set to 0.
+    if app_is_free():
+        return jsonify({
+            'error': 'The app is currently free for all users - no plan change is needed.',
+            'success': False
+        }), 400
     
     try:
         # Step 1: Validate input

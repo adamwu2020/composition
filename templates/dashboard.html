@@ -324,7 +324,7 @@
                     </div>
                     <div class="info-item">
                         <label>Queries Remaining</label>
-                        <div class="value">{{ remaining_queries }}</div>
+                        <div class="value">{% if remaining_queries == -1 %}Unlimited{% else %}{{ remaining_queries }}{% endif %}</div>
                     </div>
                     {% if subscription.days_remaining() > 0 %}
                         <div class="info-item">
@@ -396,6 +396,9 @@
 
         <div class="nav-links">
             <a href="/">Generate Articles</a>
+            {% if user.is_admin %}
+            <a href="{{ url_for('admin.dashboard') }}">Admin</a>
+            {% endif %}
             <a href="{{ url_for('auth.logout') }}">Logout</a>
         </div>
     </div>

@@ -2,7 +2,7 @@ import os
 from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash
 from flask_cors import CORS
 from flask_login import LoginManager, login_required, current_user
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, AuthenticationError
 from pypinyin import lazy_pinyin, Style
 from docx import Document
 from reportlab.lib.pagesizes import letter
@@ -14,9 +14,10 @@ from io import BytesIO
 import html
 import platform
 from dotenv import load_dotenv
-from models import db, User, QueryLog, Subscription, PLANS
+from models import db, User, QueryLog, Subscription, PLANS, get_app_price, app_is_free
 from auth import auth_bp
 from payments import payments_bp
+from admin import admin_bp
 
 # Load environment variables (override any stale shell values)
 load_dotenv(override=True)
@@ -44,6 +45,7 @@ def load_user(user_id):
 # Register blueprints
 app.register_blueprint(auth_bp, url_prefix='/auth')
 app.register_blueprint(payments_bp, url_prefix='/payment')
+app.register_blueprint(admin_bp, url_prefix='/admin')
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
@@ -222,7 +224,9 @@ def index():
                          user=fresh_user,
                          plan=plan,
                          plan_type=plan_type,
-                         remaining_queries=remaining_queries))
+                         remaining_queries=remaining_queries,
+                         app_price=get_app_price(),
+                         app_is_free=app_is_free()))
     
     # Add cache-control headers for the main page too
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
@@ -361,7 +365,28 @@ Article:"""
             'success': True,
             'remaining_queries': remaining
         })
-    
+
+    except RateLimitError as e:
+        # Upstream OpenAI account problem - NOT the user's plan or query allowance.
+        body = getattr(e, 'body', None) or {}
+        code = (body.get('error') or {}).get('code') if isinstance(body, dict) else None
+        if code in ('insufficient_quota', 'credit_balance_exhausted'):
+            message = ('The article service is temporarily unavailable: the site\'s OpenAI '
+                       'API account is out of credits. This is not a limit on your account - '
+                       'please contact the site administrator.')
+        else:
+            message = ('The article service is busy right now (rate limited upstream). '
+                       'Please try again in a moment.')
+        return jsonify({'error': message, 'success': False}), 503
+
+    except AuthenticationError:
+        return jsonify({
+            'error': ('The article service is misconfigured: the OpenAI API key is missing or '
+                      'invalid. This is not a limit on your account - please contact the site '
+                      'administrator.'),
+            'success': False
+        }), 503
+
     except Exception as e:
         return jsonify({'error': str(e), 'success': False}), 500
 

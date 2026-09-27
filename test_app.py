@@ -15,7 +15,8 @@ os.environ['OPENAI_API_KEY'] = 'sk-test-fake-key'
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app import app as flask_app
-from models import db, User, Subscription, QueryLog, PLANS
+from models import (db, User, Subscription, QueryLog, PLANS,
+                    get_app_price, set_app_price, app_is_free)
 from werkzeug.security import generate_password_hash
 
 
@@ -60,6 +61,11 @@ def make_user(username='alice', email=None, password='pass123', plan=None, plan_
         db.session.add(sub)
     db.session.commit()
     return user
+
+
+def set_price(price):
+    """Helper: set the global app price (0 = free for everyone)."""
+    return set_app_price(price)
 
 
 def login(client, username, password='pass123'):
@@ -147,6 +153,7 @@ class TestPlanLimits:
 
     def test_free_user_blocked_after_limit(self, app):
         with app.app_context():
+            set_price(9.99)
             user = make_user('free3', plan=None)
             # Exhaust free quota
             for _ in range(3):
@@ -170,6 +177,7 @@ class TestPlanLimits:
 
     def test_elite_plan_daily_limit(self, app):
         with app.app_context():
+            set_price(9.99)
             user = make_user('elite1', plan='elite')
             assert PLANS['elite']['queries_per_day'] == 10
             # Use 10 queries today
@@ -180,6 +188,7 @@ class TestPlanLimits:
 
     def test_basic_plan_weekly_limit(self, app):
         with app.app_context():
+            set_price(9.99)
             user = make_user('basic1', plan='basic')
             assert PLANS['basic']['queries_per_week'] == 3
             for _ in range(3):
@@ -189,6 +198,7 @@ class TestPlanLimits:
 
     def test_advanced_plan_monthly_limit(self, app):
         with app.app_context():
+            set_price(9.99)
             user = make_user('adv1', plan='advanced')
             assert PLANS['advanced']['queries_per_month'] == 100
             for _ in range(100):
@@ -272,6 +282,7 @@ class TestGenerateEndpoint:
     @patch('app.client')
     def test_generate_blocked_when_limit_reached(self, mock_openai, client, app):
         with app.app_context():
+            set_price(9.99)
             user = make_user('gen3', plan=None)
             for _ in range(3):
                 db.session.add(QueryLog(user_id=user.id, topic='t', language='English'))
@@ -372,3 +383,162 @@ class TestDownloadEndpoint:
             'article': self.SAMPLE_ARTICLE, 'format': 'txt', 'filename': 'test'
         })
         assert r.status_code in (302, 401)
+
+
+# ---------------------------------------------------------------------------
+# App price / free-for-all-users
+# ---------------------------------------------------------------------------
+
+class TestAppPrice:
+    def test_default_price_is_zero_and_app_is_free(self, app):
+        with app.app_context():
+            assert get_app_price() == 0
+            assert app_is_free() is True
+
+    def test_set_and_get_price_roundtrip(self, app):
+        with app.app_context():
+            set_price(12.5)
+            assert get_app_price() == 12.5
+            assert app_is_free() is False
+
+    def test_price_zero_makes_app_free(self, app):
+        with app.app_context():
+            set_price(9.99)
+            assert app_is_free() is False
+            set_price(0)
+            assert app_is_free() is True
+
+    def test_negative_price_rejected(self, app):
+        with app.app_context():
+            with pytest.raises(ValueError):
+                set_app_price(-1)
+
+    def test_non_numeric_price_rejected(self, app):
+        with app.app_context():
+            with pytest.raises(ValueError):
+                set_app_price('free')
+
+    def test_free_app_lifts_limits_for_exhausted_free_user(self, app):
+        with app.app_context():
+            set_price(9.99)
+            user = make_user('pf1', plan=None)
+            for _ in range(10):
+                db.session.add(QueryLog(user_id=user.id, topic='t', language='English'))
+            db.session.commit()
+            assert user.can_make_query() is False
+
+            set_price(0)
+            assert user.can_make_query() is True
+            assert user.get_remaining_queries() == -1
+
+    @patch('app.client')
+    def test_generate_allowed_for_all_when_free(self, mock_openai, client, app):
+        mock_choice = MagicMock()
+        mock_choice.message.content = 'Free article.'
+        mock_openai.chat.completions.create.return_value = MagicMock(choices=[mock_choice])
+
+        with app.app_context():
+            set_price(0)
+            user = make_user('pf2', plan=None)
+            # Way past the free plan's monthly allowance
+            for _ in range(20):
+                db.session.add(QueryLog(user_id=user.id, topic='t', language='English'))
+            db.session.commit()
+        login(client, 'pf2')
+        r = client.post('/generate', json={
+            'topic': 'birds', 'language': 'English',
+            'total_words': 100, 'grade': 1, 'language_level': 'intermediate'
+        })
+        assert r.status_code == 200
+        assert r.get_json()['success'] is True
+
+    def test_checkout_blocked_while_free(self, client, app):
+        with app.app_context():
+            set_price(0)
+            make_user('pf3', plan=None)
+        login(client, 'pf3')
+        r = client.post('/payment/create-checkout-session', json={'plan_type': 'elite'})
+        assert r.status_code == 400
+        assert 'free' in r.get_json()['error'].lower()
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard
+# ---------------------------------------------------------------------------
+
+class TestAdminDashboard:
+    def test_admin_requires_login(self, client):
+        r = client.get('/admin/', follow_redirects=False)
+        assert r.status_code in (302, 401)
+
+    def test_non_admin_forbidden(self, client, app):
+        with app.app_context():
+            make_user('notadmin', plan=None)
+        login(client, 'notadmin')
+        r = client.get('/admin/')
+        assert r.status_code == 403
+
+    def test_admin_user_flag(self, app):
+        with app.app_context():
+            eric = make_user('Eric', email='eric@test.com', plan='unlimited', plan_end_days=None)
+            other = make_user('someone_else', plan=None)
+            assert eric.is_admin is True
+            assert other.is_admin is False
+
+    def test_admin_can_open_dashboard(self, client, app):
+        with app.app_context():
+            make_user('Eric', email='eric@test.com', plan='unlimited', plan_end_days=None)
+        login(client, 'Eric')
+        r = client.get('/admin/')
+        assert r.status_code == 200
+        assert b'Adjust app price' in r.data
+
+    def test_admin_can_set_price(self, client, app):
+        with app.app_context():
+            make_user('Eric', email='eric@test.com', plan='unlimited', plan_end_days=None)
+        login(client, 'Eric')
+        r = client.post('/admin/price', data={'price': '7.50'}, follow_redirects=False)
+        assert r.status_code == 302
+        with app.app_context():
+            assert get_app_price() == 7.5
+            assert app_is_free() is False
+
+    def test_admin_can_make_app_free(self, client, app):
+        with app.app_context():
+            make_user('Eric', email='eric@test.com', plan='unlimited', plan_end_days=None)
+            set_price(19.99)
+        login(client, 'Eric')
+        r = client.post('/admin/make-free', follow_redirects=False)
+        assert r.status_code == 302
+        with app.app_context():
+            assert get_app_price() == 0
+            assert app_is_free() is True
+
+    def test_admin_price_zero_via_form_makes_free(self, client, app):
+        with app.app_context():
+            make_user('Eric', email='eric@test.com', plan='unlimited', plan_end_days=None)
+            set_price(4.99)
+        login(client, 'Eric')
+        client.post('/admin/price', data={'price': '0'}, follow_redirects=False)
+        with app.app_context():
+            assert app_is_free() is True
+
+    def test_admin_rejects_invalid_price(self, client, app):
+        with app.app_context():
+            make_user('Eric', email='eric@test.com', plan='unlimited', plan_end_days=None)
+            set_price(4.99)
+        login(client, 'Eric')
+        r = client.post('/admin/price', data={'price': 'abc'}, follow_redirects=False)
+        assert r.status_code == 302
+        with app.app_context():
+            assert get_app_price() == 4.99
+
+    def test_non_admin_cannot_set_price(self, client, app):
+        with app.app_context():
+            make_user('plainuser', plan=None)
+            set_price(4.99)
+        login(client, 'plainuser')
+        r = client.post('/admin/price', data={'price': '0'})
+        assert r.status_code == 403
+        with app.app_context():
+            assert get_app_price() == 4.99
